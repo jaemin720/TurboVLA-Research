@@ -20,9 +20,13 @@ results, not results produced by this repository.
 - [x] Standard LIBERO rollout evaluation
 - [x] LIBERO-PRO object, position, semantic, task, and environment suites
 - [x] Independent per-command selection of LIBERO and LIBERO-PRO
-- [ ] Project-specific method implementation
+- [x] Tri-modal token-preserving DecAlign integration (experimental)
 - [ ] Training and ablation experiments
 - [ ] Reproduced benchmark table
+
+The experimental DecAlign architecture, its differences from the source
+implementation, training flags, checkpoint behavior, and verification status
+are documented in [DECALIGN_INTEGRATION.md](DECALIGN_INTEGRATION.md).
 
 ## What this repository adds
 

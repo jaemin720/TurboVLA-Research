@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
+from .decalign.configuration import DecAlignConfig
+
 
 @dataclass
 class TextEncoderConfig:
@@ -68,6 +70,7 @@ class TurboVLAConfig:
     text: TextEncoderConfig = field(default_factory=TextEncoderConfig)
     vision: VisionEncoderConfig = field(default_factory=VisionEncoderConfig)
     interaction: InteractionConfig = field(default_factory=InteractionConfig)
+    decalign: DecAlignConfig = field(default_factory=DecAlignConfig)
     action: ActionHeadConfig = field(default_factory=ActionHeadConfig)
 
     def __post_init__(self) -> None:
@@ -99,6 +102,8 @@ class TurboVLAConfig:
             raise ValueError("interaction.attention_backend must be manual or sdpa")
         if self.interaction.compute_precision not in {"fp32", "bf16_autocast"}:
             raise ValueError("interaction.compute_precision must be fp32 or bf16_autocast")
+        if self.decalign.enabled:
+            self.decalign.validate(self.interaction.hidden_dim)
         if self.action.action_dim < 1 or self.action.state_dim < 1 or self.action.horizon < 1:
             raise ValueError("action dimensions and horizon must be positive")
 
@@ -113,5 +118,6 @@ class TurboVLAConfig:
             text=TextEncoderConfig(**dict(data.get("text", {}))),
             vision=VisionEncoderConfig(**dict(data.get("vision", {}))),
             interaction=InteractionConfig(**dict(data.get("interaction", {}))),
+            decalign=DecAlignConfig(**dict(data.get("decalign", {}))),
             action=ActionHeadConfig(**dict(data.get("action", {}))),
         )

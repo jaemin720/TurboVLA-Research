@@ -59,7 +59,20 @@ class TurboVLAActionHead(nn.Module):
         self.state_projection = StateProjection(config, hidden_dim)
         self.decoder = ACTDecoder(config, hidden_dim, nheads, dim_feedforward)
 
+    def encode_state(self, state: torch.Tensor, reference: torch.Tensor | None = None) -> torch.Tensor:
+        """Encode proprioception while retaining released-checkpoint parameter names."""
+        if reference is not None:
+            state = state.to(device=reference.device, dtype=reference.dtype)
+        return self.state_projection(state)
+
+    def decode(self, memory: torch.Tensor) -> torch.Tensor:
+        """Decode an already complete action memory.
+
+        DecAlign uses this path because proprio tokens are part of its tri-modal
+        representation and must not be appended a second time.
+        """
+        return self.decoder(memory)
+
     def forward(self, vision_language_tokens: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        state = state.to(device=vision_language_tokens.device, dtype=vision_language_tokens.dtype)
-        state_tokens = self.state_projection(state)
-        return self.decoder(torch.cat([vision_language_tokens, state_tokens], dim=1))
+        state_tokens = self.encode_state(state, reference=vision_language_tokens)
+        return self.decode(torch.cat([vision_language_tokens, state_tokens], dim=1))

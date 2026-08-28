@@ -93,6 +93,44 @@ def parse_args():
     )
     parser.add_argument("--vla_feature_enhancer_layers", type=int, default=6)
     parser.add_argument("--enhancer_inner_dim", type=int, default=1024)
+    parser.set_defaults(use_decalign=False)
+    parser.add_argument(
+        "--use_decalign",
+        dest="use_decalign",
+        action="store_true",
+        help="Replace TurboVLA bidirectional interaction with tri-modal token-preserving DecAlign.",
+    )
+    parser.add_argument("--no_use_decalign", dest="use_decalign", action="store_false")
+    parser.add_argument(
+        "--decalign_representation_mode",
+        type=str,
+        default="token_preserving",
+        choices=["token_preserving"],
+    )
+    parser.add_argument("--decalign_num_layers", type=int, default=4)
+    parser.add_argument("--decalign_num_heads", type=int, default=8)
+    parser.add_argument("--decalign_feedforward_multiplier", type=int, default=4)
+    parser.add_argument("--decalign_num_prototypes", type=int, default=7)
+    parser.add_argument("--decalign_gmm_em_iters", type=int, default=5)
+    parser.add_argument("--decalign_gmm_var_floor", type=float, default=1e-4)
+    parser.add_argument("--decalign_ot_regularization", type=float, default=0.1)
+    parser.add_argument("--decalign_ot_num_iters", type=int, default=50)
+    parser.add_argument("--decalign_pde_dim", type=int, default=64)
+    parser.add_argument("--decalign_mmd_bandwidth", type=float, default=1.0)
+    parser.add_argument("--decalign_attention_dropout", type=float, default=0.0)
+    parser.add_argument("--decalign_relu_dropout", type=float, default=0.1)
+    parser.add_argument("--decalign_residual_dropout", type=float, default=0.05)
+    parser.add_argument("--decalign_embedding_dropout", type=float, default=0.1)
+    parser.add_argument("--decalign_fusion_dropout", type=float, default=0.0)
+    parser.add_argument("--decalign_decoupling_weight", type=float, default=1.0)
+    parser.add_argument("--decalign_heterogeneous_weight", type=float, default=0.05)
+    parser.add_argument("--decalign_homogeneous_weight", type=float, default=0.05)
+    parser.add_argument(
+        "--decalign_loss_warmup_steps",
+        type=int,
+        default=0,
+        help="Linearly warm up all DecAlign auxiliary loss weights over this many optimizer steps.",
+    )
     parser.add_argument("--action_dim", type=int, default=7)
     parser.add_argument("--chunk_size", type=int, default=12)
     parser.add_argument("--state_dim", type=int, default=8)
@@ -205,7 +243,7 @@ def build_model_architecture(args):
     model_args.max_text_len = args.max_text_len
     model_args.text_padding_length = args.text_padding_length
     model_args.text_padding_length_by_instruction = text_layout.get("padding_length_by_instruction", {})
-    model_args.vla_feature_enhancer_layers = args.vla_feature_enhancer_layers
+    model_args.vla_feature_enhancer_layers = 0 if args.use_decalign else args.vla_feature_enhancer_layers
     model_args.enhancer_inner_dim = args.enhancer_inner_dim
     model_args.text_dropout = args.text_dropout
     model_args.fusion_dropout = args.fusion_dropout
@@ -223,6 +261,23 @@ def build_model_architecture(args):
     model_args.position_embedding = "view"
     model_args.encode_views_separately = True
     model_args.padding_strategy = "key_padding_mask"
+    model_args.use_decalign = args.use_decalign
+    model_args.decalign_representation_mode = args.decalign_representation_mode
+    model_args.decalign_num_layers = args.decalign_num_layers
+    model_args.decalign_num_heads = args.decalign_num_heads
+    model_args.decalign_feedforward_multiplier = args.decalign_feedforward_multiplier
+    model_args.decalign_num_prototypes = args.decalign_num_prototypes
+    model_args.decalign_gmm_em_iters = args.decalign_gmm_em_iters
+    model_args.decalign_gmm_var_floor = args.decalign_gmm_var_floor
+    model_args.decalign_ot_regularization = args.decalign_ot_regularization
+    model_args.decalign_ot_num_iters = args.decalign_ot_num_iters
+    model_args.decalign_pde_dim = args.decalign_pde_dim
+    model_args.decalign_mmd_bandwidth = args.decalign_mmd_bandwidth
+    model_args.decalign_attention_dropout = args.decalign_attention_dropout
+    model_args.decalign_relu_dropout = args.decalign_relu_dropout
+    model_args.decalign_residual_dropout = args.decalign_residual_dropout
+    model_args.decalign_embedding_dropout = args.decalign_embedding_dropout
+    model_args.decalign_fusion_dropout = args.decalign_fusion_dropout
     return build_turbovla(model_args)
 
 
@@ -335,6 +390,49 @@ def _extract_state_dict(ckpt_obj):
     if isinstance(ckpt_obj, dict):
         return ckpt_obj
     raise ValueError("unsupported checkpoint format")
+
+
+def load_decalign_compatible_baseline_checkpoint(model, ckpt_path):
+    """Load every shape-compatible baseline tensor into a DecAlign model.
+
+    TurboVLA adaptation: released encoder, projection, proprio projection, and
+    ACT decoder weights remain useful.  The removed bidirectional interaction
+    has no target keys, while newly introduced ``decalign.*`` keys have no
+    source tensors and retain their initialization.
+    """
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    source_state = _extract_state_dict(checkpoint)
+    source_state = {(key[7:] if key.startswith("module.") else key): value for key, value in source_state.items()}
+    target_state = model.state_dict()
+    mapped = {}
+    shape_mismatch = []
+    for key, tensor in source_state.items():
+        if key not in target_state:
+            continue
+        if target_state[key].shape != tensor.shape:
+            shape_mismatch.append((key, tuple(tensor.shape), tuple(target_state[key].shape)))
+            continue
+        mapped[key] = tensor
+    if not mapped:
+        raise RuntimeError("no shape-compatible TurboVLA parameters were found in the baseline checkpoint")
+
+    target_state.update(mapped)
+    missing, unexpected = model.load_state_dict(target_state, strict=False)
+    text_projection_keys = {
+        "text_encoder.text_projection.weight",
+        "text_encoder.text_projection.bias",
+    }
+    return {
+        "mapped": len(mapped),
+        "mapped_keys": set(mapped),
+        "mapped_text_projection": text_projection_keys.issubset(mapped),
+        "shape_mismatch": shape_mismatch,
+        "load_missing_after_update": list(missing),
+        "load_unexpected_after_update": list(unexpected),
+    }
 
 
 def load_interaction_from_init_checkpoint(model, ckpt_path):
@@ -456,6 +554,24 @@ def train_model():
             raise ValueError("bf16_amp precision requires CUDA")
         if not torch.cuda.is_bf16_supported():
             raise ValueError("bf16_amp requested but current CUDA device does not report bf16 support")
+    if args.use_decalign and args.require_feature_enhancer_preload:
+        raise ValueError(
+            "DecAlign replaces the bidirectional feature enhancer; pass "
+            "--no_require_feature_enhancer_preload when --use_decalign is enabled"
+        )
+    if args.require_text_proj_preload and not args.load_text_projection_from_init:
+        raise ValueError(
+            "text projection preload is required, but `--no_load_text_projection_from_init` was set"
+        )
+    if args.decalign_loss_warmup_steps < 0:
+        raise ValueError("decalign_loss_warmup_steps cannot be negative")
+    for name in (
+        "decalign_decoupling_weight",
+        "decalign_heterogeneous_weight",
+        "decalign_homogeneous_weight",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"{name} cannot be negative")
     torch.set_float32_matmul_precision("high")
 
     if args.lr_schedule_steps is None:
@@ -483,7 +599,22 @@ def train_model():
             )
 
         if args.pretrained_init_ckpt is not None:
-            if args.require_feature_enhancer_preload:
+            if args.use_decalign:
+                baseline_report = load_decalign_compatible_baseline_checkpoint(
+                    model,
+                    args.pretrained_init_ckpt,
+                )
+                if args.require_text_proj_preload and not baseline_report["mapped_text_projection"]:
+                    raise RuntimeError(
+                        "DecAlign baseline initialization did not map both text projection tensors"
+                    )
+                if rank == 0:
+                    print("DecAlign-compatible baseline initialization:")
+                    print(f"  ckpt: {args.pretrained_init_ckpt}")
+                    print(f"  mapped={baseline_report['mapped']}")
+                    print(f"  mapped_text_projection={baseline_report['mapped_text_projection']}")
+                    print(f"  shape_mismatch={baseline_report['shape_mismatch']}")
+            elif args.require_feature_enhancer_preload:
                 fe_report = load_interaction_from_init_checkpoint(model, args.pretrained_init_ckpt)
                 if rank == 0:
                     print("vision-language interaction preload from init checkpoint:")
@@ -494,7 +625,7 @@ def train_model():
                     print("missing_keys:", fe_report["missing_keys"])
                     print("shape_mismatch_keys:", fe_report["shape_mismatch_keys"])
 
-            if args.load_text_projection_from_init:
+            if args.load_text_projection_from_init and not args.use_decalign:
                 text_proj_report = load_text_projection_from_init_checkpoint(model, args.pretrained_init_ckpt)
                 if rank == 0:
                     print("text projection preload from init checkpoint:")
@@ -504,10 +635,6 @@ def train_model():
                     print(f"  skipped_shape={text_proj_report['skipped_shape']}")
                     print("missing_keys:", text_proj_report["missing_keys"])
                     print("shape_mismatch_keys:", text_proj_report["shape_mismatch_keys"])
-            elif args.require_text_proj_preload:
-                raise ValueError(
-                    "text projection preload is required, but `--no_load_text_projection_from_init` was set"
-                )
 
         if args.freeze_backbones:
             freeze_backbones(model)
@@ -530,6 +657,18 @@ def train_model():
                 f"head_wd={args.head_weight_decay}, dinov3_wd={args.dinov3_weight_decay}"
             )
             print(f"warmup_steps={args.warmup_steps}, min_lr_ratio={args.min_lr_ratio}")
+            print(
+                f"decalign={args.use_decalign}, representation={args.decalign_representation_mode}, "
+                f"layers={args.decalign_num_layers}, prototypes={args.decalign_num_prototypes}"
+            )
+            if args.use_decalign:
+                print(
+                    "decalign loss weights: "
+                    f"dec={args.decalign_decoupling_weight}, "
+                    f"hetero={args.decalign_heterogeneous_weight}, "
+                    f"homo={args.decalign_homogeneous_weight}, "
+                    f"warmup={args.decalign_loss_warmup_steps}"
+                )
             print(
                 f"shuffle: episode_buffer={args.shuffle_buffer}, "
                 f"within_episode={args.shuffle_steps_within_episode}"
@@ -631,6 +770,7 @@ def train_model():
         while global_step < args.max_steps:
             optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
+            component_accum = {"action": 0.0, "dec": 0.0, "hetero": 0.0, "homo": 0.0}
 
             for _ in range(args.grad_accum_steps):
                 try:
@@ -649,13 +789,44 @@ def train_model():
                     dtype=torch.bfloat16,
                     enabled=args.precision == "bf16_amp",
                 ):
-                    pred_actions = model(instructions, samples, states)
+                    model_output = model(
+                        instructions,
+                        samples,
+                        states,
+                        return_aux=args.use_decalign,
+                    )
+                    if args.use_decalign:
+                        pred_actions = model_output.actions
+                        if model_output.decalign is None:
+                            raise RuntimeError("DecAlign training requested but model returned no DecAlign output")
+                        decalign_losses = model_output.decalign.losses
+                    else:
+                        pred_actions = model_output
+                        decalign_losses = None
                     if pred_actions.shape != gt_actions.shape:
                         raise ValueError(
                             f"pred_actions.shape={pred_actions.shape}, gt_actions.shape={gt_actions.shape} mismatch"
                         )
 
-                    loss = masked_l1_loss(pred_actions, gt_actions, action_chunk_masks)
+                    action_loss = masked_l1_loss(pred_actions, gt_actions, action_chunk_masks)
+                    loss = action_loss
+                    component_accum["action"] += action_loss.detach().item()
+                    if decalign_losses is not None:
+                        if args.decalign_loss_warmup_steps > 0:
+                            auxiliary_scale = min(
+                                1.0,
+                                float(global_step + 1) / float(args.decalign_loss_warmup_steps),
+                            )
+                        else:
+                            auxiliary_scale = 1.0
+                        loss = loss + auxiliary_scale * (
+                            args.decalign_decoupling_weight * decalign_losses.decoupling
+                            + args.decalign_heterogeneous_weight * decalign_losses.heterogeneous
+                            + args.decalign_homogeneous_weight * decalign_losses.homogeneous
+                        )
+                        component_accum["dec"] += decalign_losses.decoupling.detach().item()
+                        component_accum["hetero"] += decalign_losses.heterogeneous.detach().item()
+                        component_accum["homo"] += decalign_losses.homogeneous.detach().item()
                 (loss / args.grad_accum_steps).backward()
                 loss_accum += loss.detach().item()
 
@@ -665,6 +836,10 @@ def train_model():
 
             local_loss = loss_accum / args.grad_accum_steps
             global_loss = reduce_mean(local_loss, device, is_distributed, world_size)
+            global_components = {
+                name: reduce_mean(value / args.grad_accum_steps, device, is_distributed, world_size)
+                for name, value in component_accum.items()
+            }
 
             loss_window.append(global_loss)
             if len(loss_window) > args.log_freq:
@@ -680,6 +855,16 @@ def train_model():
                         {
                             "loss": f"{global_loss:.5f}",
                             "avg": f"{avg_window_loss:.5f}",
+                            "action": f"{global_components['action']:.5f}",
+                            **(
+                                {
+                                    "dec": f"{global_components['dec']:.4f}",
+                                    "hete": f"{global_components['hetero']:.4f}",
+                                    "homo": f"{global_components['homo']:.4f}",
+                                }
+                                if args.use_decalign
+                                else {}
+                            ),
                             "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                         }
                     )
@@ -696,6 +881,7 @@ def train_model():
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                         "loss": global_loss,
+                        "loss_components": global_components,
                         "args": vars(args),
                         "model_config": unwrap_model(model).config.to_dict(),
                     },

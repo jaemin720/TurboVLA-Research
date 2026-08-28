@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -12,11 +13,13 @@ from .components.transformer import TransformerEncoderLayer
 from .components.utils import _get_clones
 from .configuration import (
     ActionHeadConfig,
+    DecAlignConfig,
     InteractionConfig,
     TextEncoderConfig,
     TurboVLAConfig,
     VisionEncoderConfig,
 )
+from .decalign import DecAlignOutput, TriModalDecAlign
 from .text_encoder import TurboVLATextEncoder
 from .vision_encoder import DINOv3VisionEncoder
 
@@ -91,6 +94,12 @@ class VisionLanguageInteraction(nn.Module):
         return visual_tokens, text_tokens
 
 
+@dataclass
+class TurboVLAForwardOutput:
+    actions: torch.Tensor
+    decalign: DecAlignOutput | None = None
+
+
 class TurboVLA(nn.Module):
     """Shared TurboVLA architecture for LIBERO and RoboTwin."""
 
@@ -127,7 +136,15 @@ class TurboVLA(nn.Module):
             self.register_parameter("patch_position_scale", None)
         nn.init.trunc_normal_(self.view_embedding, std=0.02)
 
-        self.vision_language_interaction = VisionLanguageInteraction(config.interaction)
+        # DecAlign is the sole multimodal interaction in DecAlign mode.  The
+        # released bidirectional feature enhancer remains untouched in baseline
+        # mode so legacy checkpoints keep their exact parameter structure.
+        if config.decalign.enabled:
+            self.vision_language_interaction = None
+            self.decalign = TriModalDecAlign(hidden_dim=hidden_dim, config=config.decalign)
+        else:
+            self.vision_language_interaction = VisionLanguageInteraction(config.interaction)
+            self.decalign = None
         self.action_head = TurboVLAActionHead(
             config=config.action,
             hidden_dim=hidden_dim,
@@ -172,7 +189,23 @@ class TurboVLA(nn.Module):
         self,
         instructions: Sequence[str],
         samples: torch.Tensor | Mapping[str, torch.Tensor],
+        state: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        condition, _ = self._encode_condition(
+            instructions=instructions,
+            samples=samples,
+            state=state,
+            compute_decalign_objectives=False,
+        )
+        return condition
+
+    def _encode_condition(
+        self,
+        instructions: Sequence[str],
+        samples: torch.Tensor | Mapping[str, torch.Tensor],
+        state: torch.Tensor | None,
+        compute_decalign_objectives: bool,
+    ) -> tuple[torch.Tensor, DecAlignOutput | None]:
         pixel_values = self._normalize_samples(samples)
         device = pixel_values.device
         precision_context = nullcontext()
@@ -186,23 +219,51 @@ class TurboVLA(nn.Module):
             if text_tokens.shape[0] != pixel_values.shape[0]:
                 raise ValueError("instruction batch size does not match image batch size")
             visual_tokens = self.encode_vision(pixel_values)
+            if self.decalign is not None:
+                if state is None:
+                    raise ValueError("state is required when DecAlign is enabled")
+                proprio_tokens = self.action_head.encode_state(state, reference=visual_tokens)
+                decalign_output = self.decalign(
+                    language_tokens=text_tokens,
+                    proprio_tokens=proprio_tokens,
+                    vision_tokens=visual_tokens,
+                    language_valid_mask=~text_key_padding_mask,
+                    compute_objectives=compute_decalign_objectives,
+                )
+                return decalign_output.action_memory, decalign_output
+
+            if self.vision_language_interaction is None:
+                raise RuntimeError("baseline mode requires vision_language_interaction")
             visual_tokens, text_tokens = self.vision_language_interaction(
                 visual_tokens=visual_tokens,
                 text_tokens=text_tokens,
                 text_key_padding_mask=text_key_padding_mask,
                 text_self_attention_masks=text_self_attention_masks,
             )
-            return torch.cat([visual_tokens, text_tokens], dim=1)
+            return torch.cat([visual_tokens, text_tokens], dim=1), None
 
     def forward(
         self,
         instructions: Sequence[str],
         samples: torch.Tensor | Mapping[str, torch.Tensor],
         state: torch.Tensor,
-    ) -> torch.Tensor:
-        condition = self.encode_condition(instructions, samples)
+        return_aux: bool = False,
+    ) -> torch.Tensor | TurboVLAForwardOutput:
+        condition, decalign_output = self._encode_condition(
+            instructions=instructions,
+            samples=samples,
+            state=state,
+            compute_decalign_objectives=return_aux and self.decalign is not None,
+        )
         action_dtype = self.action_head.decoder.action_queries.weight.dtype
-        return self.action_head(condition.to(dtype=action_dtype), state.to(dtype=action_dtype))
+        condition = condition.to(dtype=action_dtype)
+        if self.decalign is not None:
+            actions = self.action_head.decode(condition)
+        else:
+            actions = self.action_head(condition, state.to(dtype=action_dtype))
+        if return_aux:
+            return TurboVLAForwardOutput(actions=actions, decalign=decalign_output)
+        return actions
 
     # Transitional read-only names used only by legacy checkpoint initialization.
     @property
@@ -278,6 +339,25 @@ def build_turbovla(args: TurboVLAConfig | Mapping[str, Any] | Any) -> TurboVLA:
                 residual_style=str(_arg(args, "residual_style", "normalized")),
                 attention_backend=str(_arg(args, "attention_backend", "manual")),
                 compute_precision=str(_arg(args, "interaction_precision", "fp32")),
+            ),
+            decalign=DecAlignConfig(
+                enabled=bool(_arg(args, "use_decalign", False)),
+                representation_mode=str(_arg(args, "decalign_representation_mode", "token_preserving")),
+                num_layers=int(_arg(args, "decalign_num_layers", 4)),
+                num_heads=int(_arg(args, "decalign_num_heads", _arg(args, "nheads", 8))),
+                feedforward_multiplier=int(_arg(args, "decalign_feedforward_multiplier", 4)),
+                num_prototypes=int(_arg(args, "decalign_num_prototypes", 7)),
+                gmm_em_iters=int(_arg(args, "decalign_gmm_em_iters", 5)),
+                gmm_var_floor=float(_arg(args, "decalign_gmm_var_floor", 1e-4)),
+                ot_regularization=float(_arg(args, "decalign_ot_regularization", 0.1)),
+                ot_num_iters=int(_arg(args, "decalign_ot_num_iters", 50)),
+                pde_dim=int(_arg(args, "decalign_pde_dim", 64)),
+                mmd_bandwidth=float(_arg(args, "decalign_mmd_bandwidth", 1.0)),
+                attention_dropout=float(_arg(args, "decalign_attention_dropout", 0.0)),
+                relu_dropout=float(_arg(args, "decalign_relu_dropout", 0.1)),
+                residual_dropout=float(_arg(args, "decalign_residual_dropout", 0.05)),
+                embedding_dropout=float(_arg(args, "decalign_embedding_dropout", 0.1)),
+                fusion_dropout=float(_arg(args, "decalign_fusion_dropout", 0.0)),
             ),
             action=ActionHeadConfig(
                 action_dim=int(_arg(args, "action_dim", 7)),
